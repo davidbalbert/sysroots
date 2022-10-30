@@ -1,0 +1,222 @@
+#!/bin/bash
+
+function err() {
+    echo $1 >&2
+}
+
+function log() {
+    echo "[+] $1"
+}
+
+function panic() {
+    err "[!] $1"
+    exit 1
+}
+
+function fetch() {
+    log "Fetching $1"
+    if ! curl --no-progress-meter --fail --location --output $2 $1
+    then
+        panic "Error while fetching $1"
+    fi
+}
+
+function extname() {
+    local path=$1
+    local file=$(basename $path)
+    echo "${file##*.}"
+}
+
+function ensure_command() {
+    local cmd=$1
+    local message=$2
+    if ! which "$cmd" > /dev/null
+    then
+        panic $message
+    fi
+}
+
+function ensure_file() {
+    local file=$1
+
+    if [ ! -f "$file" ]
+    then
+        panic "Couldn't find file: $file"
+    fi
+}
+
+function decompress() {
+    local path=$1
+    local file=$(basename $path)
+    local extension
+
+    case $(extname $path) in
+    zst)
+        ensure_command unzstd "Missing unzstd. Try: brew install zstd"
+        unzstd --quiet $path;;
+    bz2)
+        bunzip2 --quiet $path;;
+    xz)
+        unxz --quiet $path;;
+    gz)
+        gunzip --quiet $path;;
+    *)
+        panic "Unknown compression format $path";;
+    esac
+}
+
+function extract_deb() {
+    local deb=$1
+    local destination=$2
+    local name=$(basename $deb)
+    local dir="$(dirname $deb)/$(basename $deb .deb)"
+
+    log "Extracting $name"
+
+    mkdir -p $dir
+
+    pushd $dir >/dev/null
+
+    ar -x "../$name"
+    local datafile=$(ls data.tar.* | head -n1)
+
+    if [ "$datafile" = "" ] || [ ! -f "$datafile" ]
+    then
+        panic "Can't find data.tar in $deb"
+    fi
+
+    decompress $datafile
+    tar -xf data.tar -C $destination
+
+    popd >/dev/null
+}
+
+
+# Debian signing keys (for later): https://ftp-master.debian.org/keys.html
+
+function fetch_ubuntu_archive_signing_key() {
+    local version=$1
+    local destination=$2
+    local url key_path output_path
+
+    case $version in
+    jammy)
+        url="https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/ubuntu-keyring/2021.03.26/ubuntu-keyring_2021.03.26.tar.gz"
+        key_path="ubuntu-keyring-2021.03.26/keyrings/ubuntu-keyring-2018-archive.gpg"
+        output_path="$destination/ubuntu-keyring_2021.03.26.tar.gz"
+        ;;
+    *)
+        panic "Unknown Ubuntu version: $version"
+        ;;
+    esac
+
+    log "Downloading $version archive signing key"
+    fetch $url $output_path
+
+    local depth=$(echo $key_path | awk -F/ '{print NF-1}')
+
+    tar -xzf $output_path --directory $destination --strip-components $depth $key_path
+}
+
+function ubuntu_mirror() {
+    local arch=$1
+
+    if [ "$arch" = "amd64" ] || [ "$arch" = "i386" ]
+    then
+        echo http://archive.ubuntu.com/ubuntu
+    else
+        echo http://ports.ubuntu.com/ubuntu-ports
+    fi
+}
+
+function verify() {
+    local file=$1
+    local signature=$2
+    local keyring=$3
+
+    if ! gpgv --keyring $keyring $signature $file 2> /dev/null
+    then
+        panic "Unable to verify $(basename $file)"
+    fi
+}
+
+
+if [ $# -lt 4 ]
+then
+    err "usage: $0 version arch sysroot package ..."
+    exit 1
+fi
+
+version=$1
+arch=$2
+sysroot=$(readlink -f $3)
+
+shift 3
+
+mirror=$(ubuntu_mirror $arch)
+
+tmpdir=$(mktemp -d)
+mkdir -p $sysroot
+
+
+fetch_ubuntu_archive_signing_key $version $tmpdir
+archive_key=$(ls $tmpdir/*.gpg)
+ensure_file $archive_key
+
+log "Found archive signing key: $(basename $archive_key)"
+
+
+fetch "$mirror/dists/$version/Release" "$tmpdir/Release"
+fetch "$mirror/dists/$version/Release.gpg" "$tmpdir/Release.gpg"
+
+log "Verifying Release"
+
+verify "$tmpdir/Release" "$tmpdir/Release.gpg" $archive_key
+
+
+packages_url="$mirror/dists/$version/main/binary-$arch/Packages.gz"
+packages_path="$tmpdir/Packages"
+packages_gz="$packages_path.gz"
+
+fetch $packages_url $packages_gz
+gunzip $packages_gz
+
+urls=()
+
+log "Locating packages..."
+
+while [ $# -gt 0 ]
+do
+    package=$1
+    shift
+
+    if ! line=$(grep -n "Package: $package" $packages_path)
+    then
+        panic "Unable to locate package $package"
+    fi
+
+    offset=$(echo $line | cut -d: -f1)
+    path=$(tail -n +$offset $packages_path | grep "Filename" -m 1 | awk -F": " '{ print $2 }')
+
+    if [ "$path" = "" ]
+    then
+        err "$0: Unable to find repo path for $package. This shouldn't happen."
+        exit 1
+    fi
+
+    urls+=("$mirror/$path")
+done
+
+for url in ${urls[@]}
+do
+    path="$tmpdir/$(basename $url)"
+    fetch $url $path
+done
+
+for url in ${urls[@]}
+do
+    extract_deb "$tmpdir/$(basename $url)" $sysroot
+done
+
+# find $tmpdir
+rm -rf $tmpdir
