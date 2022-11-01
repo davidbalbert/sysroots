@@ -155,16 +155,17 @@ function verify_sha256() {
 }
 
 function release_read_sha256() {
-    local repo_path=$1
+    local release=$1
+    local repo_path=$2
 
-    local shastart=$(grep --line-number --max-count=1 ^SHA256: Release | cut -d: -f1)
+    local shastart=$(grep --line-number --max-count=1 ^SHA256: $1 | cut -d: -f1)
     if [ "$shastart" = "" ]; then
-        panic "Unable to find SHA256 sums in Release"
+        return
     fi
 
     local expected=$(tail -n +$shastart $release | grep --max-count=1 $repo_path | awk '{ print $1 }')
     if [ "$expected" = "" ]; then
-        panic "Unable to locate expected SHA256 sum for $repo_path"
+        return
     fi
 
     echo $expected
@@ -178,14 +179,16 @@ fi
 
 version=$1
 arch=$2
-sysroot=$(readlink -f $3)
+relroot=$3
 
 shift 3
 
 mirror=$(ubuntu_mirror $arch)
 
 tmpdir=$(mktemp -d)
-mkdir -p $sysroot
+
+mkdir -p $relroot
+sysroot=$(readlink -f $relroot)
 
 
 fetch_ubuntu_archive_signing_key $version $tmpdir
@@ -194,6 +197,7 @@ ensure_file $archive_key
 
 log "Found archive signing key: $(basename $archive_key)"
 
+# TODO: Change this to InRelease which includes both the signature and the data
 release="$tmpdir/Release"
 
 fetch "$mirror/dists/$version/Release" $release
@@ -213,7 +217,11 @@ gunzip $packages_gz
 
 log "Verifying Packages"
 
-expected=$(release_read_sha256 $packages_path)
+expected=$(release_read_sha256 $release $packages_path)
+if [ "$expected" = "" ]; then
+    panic "Unable to read SHA256 of $packages_path from $release"
+fi
+
 verify_sha256 $packages $expected
 
 urls=()
@@ -260,4 +268,21 @@ do
     extract_deb "$tmpdir/$(basename $url)" $sysroot
 done
 
+log "Fixing symlinks..."
+
+pushd $sysroot > /dev/null
+
+for link in $(find . -type l -lname '/*')
+do
+    dir=$(dirname $link)
+    absolute_target=$(readlink $link)
+    prefix=$(dirname "$dir" | sed 's@[^/]*@\.\.@g')
+    relative_target="$prefix$absolute_target"
+
+    ln -snf $relative_target $link
+done
+
+popd > /dev/null
+
+# echo $tmpdir
 rm -rf $tmpdir
