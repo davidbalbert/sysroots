@@ -142,13 +142,23 @@ function verify_sig() {
 
 function verify_sha256() {
     local file=$1
-    local repo_path=$2
-    local release=$3
+    local expected=$2
+
+    local actual=$(shasum -a 256 $file | awk '{ print $1 }')
+    if [ "$actual" = "" ]; then
+        panic "Unable to compute SHA256 sum for $file"
+    fi
+
+    if [ ! "$actual" = "$expected" ]; then
+        panic "Unexpected SHA256 sum for $(basename $file). Expected $expected but got $actual."
+    fi
+}
+
+function release_read_sha256() {
+    local repo_path=$1
 
     local shastart=$(grep --line-number --max-count=1 ^SHA256: Release | cut -d: -f1)
-
-    if [ "$shastart" = "" ]
-    then
+    if [ "$shastart" = "" ]; then
         panic "Unable to find SHA256 sums in Release"
     fi
 
@@ -157,14 +167,7 @@ function verify_sha256() {
         panic "Unable to locate expected SHA256 sum for $repo_path"
     fi
 
-    local actual=$(shasum -a 256 $file | awk '{ print $1 }')
-    if [ "$actual" = "" ]; then
-        panic "Unable to calculate SHA256 sum for $file"
-    fi
-
-    if [ ! "$actual" = "$expected" ]; then
-        panic "Unexpected SHA256 sum for $(basename $file). Expected $expected but got $actual."
-    fi
+    echo $expected
 }
 
 if [ $# -lt 4 ]
@@ -210,13 +213,11 @@ gunzip $packages_gz
 
 log "Verifying Packages"
 
-verify_sha256 $packages $packages_path $release
-
-exit 1
+expected=$(release_read_sha256 $packages_path)
+verify_sha256 $packages $expected
 
 urls=()
-
-log "Locating packages..."
+shasums=()
 
 while [ $# -gt 0 ]
 do
@@ -229,7 +230,8 @@ do
     fi
 
     offset=$(echo $line | cut -d: -f1)
-    path=$(tail -n +$offset $packages | grep "Filename" -m 1 | awk -F": " '{ print $2 }')
+    path=$(tail -n +$offset $packages | grep --max-count=1 "Filename: " | awk -F": " '{ print $2 }')
+    shasum=$(tail -n +$offset $packages | grep --max-count=1 "SHA256: " | awk -F": " '{ print $2 }')
 
     if [ "$path" = "" ]
     then
@@ -238,12 +240,19 @@ do
     fi
 
     urls+=("$mirror/$path")
+    shasums+=("$shasum")
 done
 
-for url in ${urls[@]}
+for index in ${!urls[@]}
 do
+    url=${urls[$index]}
+    expected=${shasums[$index]}
+
     path="$tmpdir/$(basename $url)"
     fetch $url $path
+
+    log "Verifying $(basename $path)"
+    verify_sha256 $path $expected
 done
 
 for url in ${urls[@]}
@@ -251,5 +260,4 @@ do
     extract_deb "$tmpdir/$(basename $url)" $sysroot
 done
 
-# find $tmpdir
 rm -rf $tmpdir
