@@ -93,8 +93,6 @@ function extract_deb() {
     local name=$(basename $deb)
     local dir="$(dirname $deb)/$(basename $deb .deb)"
 
-    log "Extracting $name"
-
     mkdir -p $dir
 
     pushd $dir >/dev/null
@@ -257,7 +255,7 @@ fi
 
 verify_sha256 $packages $expected
 
-urls=()
+paths=()
 shasums=()
 
 while [ $# -gt 0 ]
@@ -271,36 +269,33 @@ do
     fi
 
     offset=$(echo $line | cut -d: -f1)
-    path=$(tail -n +$offset $packages | grep --max-count=1 "Filename: " | awk -F": " '{ print $2 }')
+    repo_path=$(tail -n +$offset $packages | grep --max-count=1 "Filename: " | awk -F": " '{ print $2 }')
     shasum=$(tail -n +$offset $packages | grep --max-count=1 "SHA256: " | awk -F": " '{ print $2 }')
 
-    if [ "$path" = "" ]
+    if [ "$repo_path" = "" ]
     then
         panic "Unable to find repo path for $package. This shouldn't happen."
     fi
 
-    urls+=("$mirror/$path")
-    shasums+=("$shasum")
-done
-
-paths=()
-
-for index in ${!urls[@]}
-do
-    url=${urls[$index]}
-    expected=${shasums[$index]}
+    url="$mirror/$repo_path"
 
     log "Fetching $url"
     path=$(fetch $url $tmpdir)
 
-    log "Verifying $(basename $path)"
-    verify_sha256 $path $expected
-
-    paths+=("$path")
+    paths+=($path)
+    shasums+=("$shasum")
 done
 
-for path in ${paths[@]}
+for index in ${!paths[@]}
 do
+    path=${paths[$index]}
+    expected=${shasums[$index]}
+    filename=$(basename $path)
+
+    log "Verifying $filename"
+    verify_sha256 $path $expected
+
+    log "Extracting $filename"
     extract_deb $path $sysroot
 done
 
