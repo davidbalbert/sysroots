@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 function err() {
     echo $1 >&2
 }
@@ -13,18 +15,33 @@ function panic() {
     exit 1
 }
 
+# fetch("https://www.example.com/foo/bar.tar", "/tmp") -> "/tmp/www.example.com/foo/bar.tar"
 function fetch() {
-    log "Fetching $1"
-    if ! curl --no-progress-meter --fail --location --output $2 $1
+    local url=$1
+    local destination=$2
+    local localpath="$destination/$(strip_scheme $url)"
+
+    mkdir -p $(dirname $localpath)
+
+    if ! curl --no-progress-meter --fail --location --output $localpath $url
     then
         panic "Error while fetching $1"
     fi
+
+    echo $localpath
 }
 
 function extname() {
     local path=$1
     local file=$(basename $path)
     echo "${file##*.}"
+}
+
+function remove_ext() {
+    local path=$1
+    local ext=".$(extname $path)"
+
+    echo "$(dirname $path)/$(basename $path $ext)"
 }
 
 function ensure_command() {
@@ -53,15 +70,20 @@ function decompress() {
     case $(extname $path) in
     zst)
         ensure_command unzstd "Missing unzstd. Try: brew install zstd"
-        unzstd --quiet $path;;
+        unzstd --quiet $path
+        ;;
     bz2)
-        bunzip2 --quiet $path;;
+        bunzip2 --quiet $path
+        ;;
     xz)
-        unxz --quiet $path;;
+        unxz --quiet $path
+        ;;
     gz)
-        gunzip --quiet $path;;
+        gunzip --quiet $path
+        ;;
     *)
-        panic "Unknown compression format $path";;
+        panic "Unknown compression format $path"
+        ;;
     esac
 }
 
@@ -91,31 +113,35 @@ function extract_deb() {
     popd >/dev/null
 }
 
+function strip_scheme() {
+    local url=$1
+
+    echo $(echo $url | sed -E 's@^https?://@@')
+}
 
 # Debian signing keys (for later): https://ftp-master.debian.org/keys.html
 
 function fetch_ubuntu_archive_signing_key() {
     local version=$1
     local destination=$2
-    local url key_path output_path
+    local url key_path
 
     case $version in
     jammy)
         url="https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/ubuntu-keyring/2021.03.26/ubuntu-keyring_2021.03.26.tar.gz"
         key_path="ubuntu-keyring-2021.03.26/keyrings/ubuntu-keyring-2018-archive.gpg"
-        output_path="$destination/ubuntu-keyring_2021.03.26.tar.gz"
         ;;
     *)
         panic "Unknown Ubuntu version: $version"
         ;;
     esac
 
-    log "Downloading $version archive signing key"
-    fetch $url $output_path
+    log "Fetching $url"
+    local archive_path=$(fetch $url $destination)
 
     local depth=$(echo $key_path | awk -F/ '{print NF-1}')
 
-    tar -xzf $output_path --directory $destination --strip-components $depth $key_path
+    tar -xzf $archive_path --directory $destination --strip-components $depth $key_path
 }
 
 function ubuntu_mirror() {
@@ -150,20 +176,20 @@ function verify_sha256() {
     fi
 
     if [ ! "$actual" = "$expected" ]; then
-        panic "Unexpected SHA256 sum for $(basename $file). Expected $expected but got $actual."
+        panic "Unexpected SHA256 sum for $(basename $file). Expected $expected, but got $actual."
     fi
 }
 
 function release_read_sha256() {
     local release=$1
-    local repo_path=$2
+    local dist_path=$2
 
     local shastart=$(grep --line-number --max-count=1 ^SHA256: $1 | cut -d: -f1)
     if [ "$shastart" = "" ]; then
         return
     fi
 
-    local expected=$(tail -n +$shastart $release | grep --max-count=1 $repo_path | awk '{ print $1 }')
+    local expected=$(tail -n +$shastart $release | grep --max-count=1 $dist_path | awk '{ print $1 }')
     if [ "$expected" = "" ]; then
         return
     fi
@@ -190,34 +216,41 @@ tmpdir=$(mktemp -d)
 mkdir -p $relroot
 sysroot=$(readlink -f $relroot)
 
-
 fetch_ubuntu_archive_signing_key $version $tmpdir
-archive_key=$(ls $tmpdir/*.gpg)
+archive_key=$(ls $tmpdir/*.gpg | head -n1)
 ensure_file $archive_key
 
 log "Found archive signing key: $(basename $archive_key)"
 
 # TODO: Change this to InRelease which includes both the signature and the data
-release="$tmpdir/Release"
 
-fetch "$mirror/dists/$version/Release" $release
-fetch "$mirror/dists/$version/Release.gpg" "$tmpdir/Release.gpg"
+dist="$mirror/dists/$version"
+
+release_url="$dist/Release"
+release_gpg_url="$dist/Release.gpg"
+
+log "Fetching $release_url"
+release=$(fetch $release_url $tmpdir)
+
+log "Fetching $release_gpg_url"
+release_gpg=$(fetch $release_gpg_url $tmpdir)
 
 log "Verifying Release"
 
-verify_sig $release "$tmpdir/Release.gpg" $archive_key
+verify_sig $release $release_gpg $archive_key
 
-packages_path="main/binary-$arch/Packages"
-packages_url="$mirror/dists/$version/$packages_path.gz"
-packages="$tmpdir/Packages"
-packages_gz="$packages.gz"
+packages_repo_path="main/binary-$arch/Packages"
+packages_gz_url="$dist/main/binary-$arch/Packages.gz"
 
-fetch $packages_url $packages_gz
+log "Fetching $packages_gz_url"
+packages_gz=$(fetch $packages_gz_url $tmpdir)
+packages=$(remove_ext $packages_gz)
+
 gunzip $packages_gz
 
 log "Verifying Packages"
 
-expected=$(release_read_sha256 $release $packages_path)
+expected=$(release_read_sha256 $release $packages_repo_path)
 if [ "$expected" = "" ]; then
     panic "Unable to read SHA256 of $packages_path from $release"
 fi
@@ -243,29 +276,32 @@ do
 
     if [ "$path" = "" ]
     then
-        err "$0: Unable to find repo path for $package. This shouldn't happen."
-        exit 1
+        panic "Unable to find repo path for $package. This shouldn't happen."
     fi
 
     urls+=("$mirror/$path")
     shasums+=("$shasum")
 done
 
+paths=()
+
 for index in ${!urls[@]}
 do
     url=${urls[$index]}
     expected=${shasums[$index]}
 
-    path="$tmpdir/$(basename $url)"
-    fetch $url $path
+    log "Fetching $url"
+    path=$(fetch $url $tmpdir)
 
     log "Verifying $(basename $path)"
     verify_sha256 $path $expected
+
+    paths+=("$path")
 done
 
-for url in ${urls[@]}
+for path in ${paths[@]}
 do
-    extract_deb "$tmpdir/$(basename $url)" $sysroot
+    extract_deb $path $sysroot
 done
 
 log "Fixing symlinks..."
@@ -284,5 +320,4 @@ done
 
 popd > /dev/null
 
-# echo $tmpdir
 rm -rf $tmpdir
