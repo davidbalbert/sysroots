@@ -195,6 +195,14 @@ function release_read_sha256() {
     echo $expected
 }
 
+function required_debs() {
+    local packages=$1
+
+    local required_numbers=$(grep -E "^Package: |^Priority: required" $packages | grep -n "^Priority: required" | cut -d: -f1)
+
+    echo $required_numbers
+}
+
 if [ $# -lt 4 ]
 then
     err "usage: $0 version arch sysroot package ..."
@@ -254,6 +262,15 @@ if [ "$expected" = "" ]; then
 fi
 
 verify_sha256 $packages $expected
+
+# to_install=$(required_debs $packages)
+# to_install="$to_install $@"
+#
+# echo $to_install
+
+required_debs $packages
+
+exit 1
 
 paths=()
 shasums=()
