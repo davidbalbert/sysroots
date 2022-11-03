@@ -198,14 +198,12 @@ function release_read_sha256() {
 function required_debs() {
     local packages=$1
 
-    local required_numbers=$(grep -E "^Package: |^Priority: required" $packages | grep -n "^Priority: required" | cut -d: -f1)
-
-    echo $required_numbers
+    grep -E "^Package: |^Priority: required" $packages | awk -F': ' '/^Priority: required/ { print line } { line = $2 }'
 }
 
-if [ $# -lt 4 ]
+if [ $# -lt 3 ]
 then
-    err "usage: $0 version arch sysroot package ..."
+    err "usage: $0 version arch sysroot [package ...]"
     exit 1
 fi
 
@@ -268,21 +266,19 @@ verify_sha256 $packages $expected
 #
 # echo $to_install
 
-required_debs $packages
-
-exit 1
+base_debs=$(required_debs $packages)
+extra_debs=$@
+debs=$(echo "$base_debs $extra_debs" | tr ' ' '\n' | sort | uniq)
 
 paths=()
 shasums=()
 
-while [ $# -gt 0 ]
+for deb in $debs
 do
-    package=$1
-    shift
 
-    if ! line=$(grep -n "Package: $package" $packages)
+    if ! line=$(grep -n "Package: $deb" $packages)
     then
-        panic "Unable to locate package $package"
+        panic "Unable to locate package $deb"
     fi
 
     offset=$(echo $line | cut -d: -f1)
