@@ -6,6 +6,10 @@ function err() {
     echo $1 >&2
 }
 
+function errcat() {
+    cat >&2
+}
+
 function log() {
     echo "[+] $1"
 }
@@ -120,17 +124,17 @@ function strip_scheme() {
 # Debian signing keys (for later): https://ftp-master.debian.org/keys.html
 
 function fetch_ubuntu_archive_signing_key() {
-    local version=$1
+    local suite=$1
     local destination=$2
     local url key_path
 
-    case $version in
+    case $suite in
     jammy)
         url="https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/ubuntu-keyring/2021.03.26/ubuntu-keyring_2021.03.26.tar.gz"
         key_path="ubuntu-keyring-2021.03.26/keyrings/ubuntu-keyring-2018-archive.gpg"
         ;;
     *)
-        panic "Unknown Ubuntu version: $version"
+        panic "Unknown Ubuntu version: $suite"
         ;;
     esac
 
@@ -321,14 +325,55 @@ function resolve_dependencies() {
     echo ${pkgs[@]}
 }
 
-if [ $# -lt 3 ]
-then
-    err "usage: $0 version arch sysroot [package ...]"
+function usage() {
+    err "usage: $0 [options] <suite> <target> [package ...]"
+    err
+    errcat <<END
+        --help      show this message
+
+        --arch=A    set the target architecture (i386, amd64, arm64, etc.)
+        --arch A
+END
+}
+
+exclude_required=""
+arch=$(uname -m)
+
+while true; do
+    case "$1" in
+        --help)
+            usage
+            exit
+            ;;
+        --arch=*)
+            [ -z "${1#--arch=}" ] && panic "--arch= requires an argument"
+            arch="${1#--arch=}"
+            shift
+            ;;
+        --arch)
+            [ -z "$2" ] && panic "--arch requires an argument"
+            arch="$2"
+            shift 2
+            ;;
+        --exclude-required)
+            exclude_required=true
+            shift
+            ;;
+        --*)
+            panic "unknown option: $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ $# -lt 2 ]; then
+    usage
     exit 1
 fi
 
-version=$1
-arch=$2
+suite=$1
 relroot=$3
 
 shift 3
@@ -340,7 +385,7 @@ tmpdir=$(mktemp -d)
 mkdir -p $relroot
 sysroot=$(readlink -f $relroot)
 
-fetch_ubuntu_archive_signing_key $version $tmpdir
+fetch_ubuntu_archive_signing_key $suite $tmpdir
 archive_key=$(ls $tmpdir/*.gpg | head -n1)
 ensure_file $archive_key
 
@@ -348,7 +393,7 @@ log "Found archive signing key: $(basename $archive_key)"
 
 # TODO: Change this to InRelease which includes both the signature and the data
 
-dist="$mirror/dists/$version"
+dist="$mirror/dists/$suite"
 
 release_url="$dist/Release"
 release_gpg_url="$dist/Release.gpg"
