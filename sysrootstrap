@@ -201,6 +201,126 @@ function required_debs() {
     grep -E "^Package: |^Priority: required" $packages | awk -F': ' '/^Priority: required/ { print line } { line = $2 }'
 }
 
+function get_raw_dependencies() {
+    local packages=$1
+    local name=$2
+    local deptype=$3 # "Depends or Pre-Depends"
+
+    grep -E "^Package: |^$deptype: " $packages | awk -F': ' "/^$deptype: / { print package \":\", \$2 } { package = \$2 }" | grep "^$name:" | awk -F': ' '{ print $2 }'
+}
+
+# Prints each dependency on a separate line. A group of substitutes (foo | bar | baz)
+# are printed on a single line separated by spaces (foo bar baz).
+function parse_pre_depends() {
+    local packages=$1
+    local name=$2
+
+    IFS=$'\n'
+    for dep in $(get_raw_dependencies $packages $name Pre-Depends | sed 's/, /\n/g' | sed 's/ | / /g' | sed -E 's/ \([^)]*\)//g')
+    do
+        echo $dep
+    done
+    unset IFS
+}
+
+# Prints each dependency on a separate line. A group of substitutes (foo | bar | baz)
+# are printed on a single line separated by spaces (foo bar baz).
+function parse_depends() {
+    local packages=$1
+    local name=$2
+
+    IFS=$'\n'
+    for dep in $(get_raw_dependencies $packages $name Depends | sed 's/, /\n/g' | sed 's/ | / /g' | sed -E 's/ \([^)]*\)//g')
+    do
+        echo $dep
+    done
+    unset IFS
+}
+
+function package_exists() {
+    local packages=$1
+    local name=$2
+
+    grep "^Package: $name$" $packages >/dev/null
+}
+
+function resolve_dependencies() {
+    local packages=$1
+    declare -a pkgs
+    declare -a queue
+
+    while read -r deb
+    do
+        queue+=("$deb")
+    done
+
+    while [ ! ${#queue[@]} = 0 ]
+    do
+        local pkg="${queue[0]}"
+        queue=("${queue[@]:1}") # shift
+
+        for p in "${pkgs[@]}"; do
+            if [ "$p" = "$pkg" ]; then
+                continue
+            fi
+        done
+
+        pkgs+=("$pkg")
+
+        declare -a deps
+
+        for line in $(parse_pre_depends $packages $pkg); do
+            deps+=("$line")
+        done
+
+        for line in $(parse_depends $packages $pkg); do
+            deps+=("$line")
+        done
+
+        for line in "${deps[@]}"; do
+            for p in "${pkgs[@]}"; do
+                for opt in $line; do
+                    if [ "$opt" = "$p" ]; then
+                        continue 3
+                    fi
+                done
+            done
+
+            for p in "${queue[@]}"; do
+                for opt in $line; do
+                    if [ "$opt" = "$p" ]; then
+                        continue 3
+                    fi
+                done
+            done
+
+            local first_opt=$(echo $line | awk '{ print $1 }')
+            queue+=("$first_opt")
+        done
+    done
+
+
+    # while ! $queue.isEmpty; do
+    #   pkg = $queue.shift
+    #
+    #   if $pkgs.contains($pkg); then
+    #     continue
+    #   fi
+    #
+    #   pkgs+=($pkg)
+    #
+    #   deps = pre_depends($pkg) + depends($pkg)
+    #   for each line in deps; do
+    #       opts = line.split(' ')
+    #       if opts.none? { $0.in? $pkgs } && opts.none? { $0.in? $queue }; then
+    #           queue+=($opts[0])
+    #       fi
+    #   done
+    # done
+
+    echo ${pkgs[@]}
+}
+
 if [ $# -lt 3 ]
 then
     err "usage: $0 version arch sysroot [package ...]"
@@ -261,32 +381,30 @@ fi
 
 verify_sha256 $packages $expected
 
-# to_install=$(required_debs $packages)
-# to_install="$to_install $@"
-#
-# echo $to_install
-
 base_debs=$(required_debs $packages)
 extra_debs=$@
-debs=$(echo "$base_debs $extra_debs" | tr ' ' '\n' | sort | uniq)
+
+log "Resolving dependencies..."
+debs=$(echo "$base_debs $extra_debs" | tr ' ' '\n' | sort | uniq | resolve_dependencies $packages)
+
+log "Installing $debs"
 
 paths=()
 shasums=()
 
-for deb in $debs
-do
-
-    if ! line=$(grep -n "Package: $deb" $packages)
-    then
-        panic "Unable to locate package $deb"
+for deb in $debs; do
+    if ! line=$(grep -n "^Package: $deb$" $packages); then
+        # Some packages (e.g. awk) don't actually exist. Instead, other packages
+        # (like mawk and gawk) say that they "Provides: awk". It seems debootstrap
+        # just ignores those packages, so we will too.
+        continue
     fi
 
     offset=$(echo $line | cut -d: -f1)
     repo_path=$(tail -n +$offset $packages | grep --max-count=1 "Filename: " | awk -F": " '{ print $2 }')
     shasum=$(tail -n +$offset $packages | grep --max-count=1 "SHA256: " | awk -F": " '{ print $2 }')
 
-    if [ "$repo_path" = "" ]
-    then
+    if [ "$repo_path" = "" ]; then
         panic "Unable to find repo path for $package. This shouldn't happen."
     fi
 
