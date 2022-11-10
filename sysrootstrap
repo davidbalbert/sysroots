@@ -6,10 +6,6 @@ function err() {
     echo $1 >&2
 }
 
-function errcat() {
-    cat >&2
-}
-
 function log() {
     echo "[+] $1"
 }
@@ -241,13 +237,6 @@ function parse_depends() {
     unset IFS
 }
 
-function package_exists() {
-    local packages=$1
-    local name=$2
-
-    grep "^Package: $name$" $packages >/dev/null
-}
-
 function resolve_dependencies() {
     local packages=$1
     declare -a pkgs
@@ -325,18 +314,44 @@ function resolve_dependencies() {
     echo ${pkgs[@]}
 }
 
-function usage() {
-    err "usage: $0 [options] <suite> <target> [package ...]"
-    err
-    errcat <<END
-        --help      show this message
+function package_exists() {
+    local packages=$1
+    local name=$2
 
-        --arch=A    set the target architecture (i386, amd64, arm64, etc.)
+    grep "^Package: $name$" $packages >/dev/null
+}
+
+# Some packages (e.g. awk) don't actually exist. Instead, other packages
+# (like mawk and gawk) say that they "Provides: awk". It seems debootstrap
+# just ignores those packages, so we will too.
+function remove_nonexistant_packages() {
+    local packages=$1
+
+    while read -r deb; do
+        if package_exists $packages $deb; then
+            echo $deb
+        fi
+    done
+}
+
+function usage() {
+    err "usage: $0 [options] <suite> <target>"
+    err
+    cat >&2 <<END
+        --help                  show this message
+
+        --arch=A                set the target architecture (i386, amd64, arm64, etc.)
         --arch A
+
+        --include=A,B,C         adds specified packages to target
+        --include A,B,C
+
+        --exclude-required      don't install required debs
 END
 }
 
 exclude_required=""
+included_debs=""
 arch=$(uname -m)
 
 while true; do
@@ -353,6 +368,16 @@ while true; do
         --arch)
             [ -z "$2" ] && panic "--arch requires an argument"
             arch="$2"
+            shift 2
+            ;;
+        --include=*)
+            [ -z "${1#--include=}" ] && panic "--include= requires an argument"
+            included_debs=$(echo "${1#--include=}" | tr ',' ' ')
+            shift
+            ;;
+        --include)
+            [ -z "$2" ] && panic "--include requires an argument"
+            included_debs=$(echo "$2" | tr ',' ' ')
             shift 2
             ;;
         --exclude-required)
@@ -374,9 +399,9 @@ if [ $# -lt 2 ]; then
 fi
 
 suite=$1
-relroot=$3
+relroot=$2
 
-shift 3
+shift 2
 
 mirror=$(ubuntu_mirror $arch)
 
@@ -426,11 +451,27 @@ fi
 
 verify_sha256 $packages $expected
 
-base_debs=$(required_debs $packages)
-extra_debs=$@
+if [ -n "$exclude_required" ]; then
+    base_debs=""
+else
+    base_debs=$(required_debs $packages)
+fi
+
+requested_debs="$base_debs $included_debs"
+
+if [ -z "${requested_debs// }" ]; then
+    log "Nothing to install"
+    exit 0
+fi
+
+for deb in $requested_debs; do
+    if ! package_exists $packages $deb; then
+        panic "Unknown package $deb"
+    fi
+done
 
 log "Resolving dependencies..."
-debs=$(echo "$base_debs $extra_debs" | tr ' ' '\n' | sort | uniq | resolve_dependencies $packages)
+debs=$(echo "$requested_debs" | tr ' ' '\n' | sort | uniq | resolve_dependencies $packages | remove_nonexistant_packages $packages)
 
 log "Installing $debs"
 
@@ -438,12 +479,7 @@ paths=()
 shasums=()
 
 for deb in $debs; do
-    if ! line=$(grep -n "^Package: $deb$" $packages); then
-        # Some packages (e.g. awk) don't actually exist. Instead, other packages
-        # (like mawk and gawk) say that they "Provides: awk". It seems debootstrap
-        # just ignores those packages, so we will too.
-        continue
-    fi
+    line=$(grep -n "^Package: $deb$" $packages)
 
     offset=$(echo $line | cut -d: -f1)
     repo_path=$(tail -n +$offset $packages | grep --max-count=1 "Filename: " | awk -F": " '{ print $2 }')
