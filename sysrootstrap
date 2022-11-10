@@ -311,7 +311,7 @@ function resolve_dependencies() {
     #   done
     # done
 
-    echo ${pkgs[@]}
+    echo ${pkgs[@]} | tr ' ' '\n'
 }
 
 function package_exists() {
@@ -479,7 +479,9 @@ paths=()
 shasums=()
 
 for deb in $debs; do
-    line=$(grep -n "^Package: $deb$" $packages)
+    if ! line=$(grep -n "^Package: $deb$" $packages); then
+        panic "Unable to find $deb. Shouldn't get here."
+    fi
 
     offset=$(echo $line | cut -d: -f1)
     repo_path=$(tail -n +$offset $packages | grep --max-count=1 "Filename: " | awk -F": " '{ print $2 }')
@@ -498,8 +500,7 @@ for deb in $debs; do
     shasums+=("$shasum")
 done
 
-for index in ${!paths[@]}
-do
+for index in ${!paths[@]}; do
     path=${paths[$index]}
     expected=${shasums[$index]}
     filename=$(basename $path)
